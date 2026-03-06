@@ -34,7 +34,10 @@ function createProxy(service: string, pathPrefix: string, targetPathPrefix: stri
   const proxyOptions: Options = {
     target: getTarget(service),
     changeOrigin: true,
-    pathRewrite: { [`^${pathPrefix}`]: targetPathPrefix },
+    // Express strips the mount path (pathPrefix) from req.url before the
+    // proxy middleware sees it, so we rewrite the remaining relative path
+    // by prepending the target prefix.
+    pathRewrite: { '^/': `${targetPathPrefix}/` },
     on: {
       proxyReq: (proxyReq, req) => {
         // Forward correlation ID
