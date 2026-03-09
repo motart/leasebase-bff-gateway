@@ -76,6 +76,53 @@ function createProxy(service: string, pathPrefix: string, targetPathPrefix: stri
   logger.info({ service, pathPrefix, targetPathPrefix }, `Proxy route registered`);
 }
 
+// ── Stripe webhook proxy (raw body passthrough) ─────────────────────────────
+// Webhook paths must forward the raw body intact for Stripe signature verification.
+// The standard proxy uses fixRequestBody which re-serializes parsed JSON — that
+// breaks signature verification. This dedicated proxy streams the raw body.
+const webhookProxy = createProxyMiddleware({
+  target: getTarget('payments'),
+  changeOrigin: true,
+  pathRewrite: { '^/': '/internal/payments/' },
+  on: {
+    proxyReq: (proxyReq, req) => {
+      const correlationId = (req as any).correlationId;
+      if (correlationId) proxyReq.setHeader('x-correlation-id', correlationId);
+      // Forward stripe-signature header (critical for verification)
+      const sig = req.headers['stripe-signature'];
+      if (sig) proxyReq.setHeader('stripe-signature', sig as string);
+      // Do NOT call fixRequestBody — let the raw body stream through.
+      // The raw body is already available because express.json() stored it
+      // and we need to re-stream it from req (the original readable stream
+      // is consumed by express.json). We write the raw buffer directly.
+      if (req.body && Buffer.isBuffer(req.body)) {
+        proxyReq.setHeader('Content-Length', req.body.length.toString());
+        proxyReq.write(req.body);
+        proxyReq.end();
+      } else if (req.body) {
+        // Fallback: re-serialize (may break signature, but prevents hang)
+        const bodyStr = JSON.stringify(req.body);
+        proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyStr).toString());
+        proxyReq.write(bodyStr);
+        proxyReq.end();
+      }
+    },
+    error: (err, _req, res) => {
+      logger.error({ err }, 'Webhook proxy error');
+      if ('writeHead' in res && typeof res.writeHead === 'function') {
+        (res as any).writeHead(502);
+        (res as any).end(JSON.stringify({
+          error: { code: 'BAD_GATEWAY', message: 'Payments webhook service unavailable' },
+        }));
+      }
+    },
+  },
+});
+
+// Mount webhook proxy BEFORE the general payments proxy (more specific first)
+app.use('/api/payments/webhooks', webhookProxy);
+logger.info('Webhook proxy route registered: /api/payments/webhooks → payments-service');
+
 // Register proxy routes (order matters — more specific first)
 createProxy('auth', '/api/auth', '/internal/auth');
 createProxy('properties', '/api/properties', '/internal/properties');
