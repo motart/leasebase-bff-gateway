@@ -1,4 +1,4 @@
-import { createApp, startApp, logger } from '@leasebase/service-common';
+import { createApp, startApp, logger, queryOne } from '@leasebase/service-common';
 import { createProxyMiddleware, fixRequestBody, type Options } from 'http-proxy-middleware';
 
 const app = createApp();
@@ -18,6 +18,82 @@ if (!IS_PRODUCTION && process.env.DEV_AUTH_BYPASS === 'true') {
 // Dev bypass header names
 const DEV_BYPASS_HEADERS = ['x-dev-user-email', 'x-dev-user-role', 'x-dev-org-id'];
 
+// ── BFF role enrichment ─────────────────────────────────────────────────────
+// Internal header used to forward DB-backed role to downstream microservices.
+// MUST be stripped from incoming requests to prevent external injection.
+const ENRICHED_ROLE_HEADER = 'x-lb-enriched-role';
+
+/**
+ * Decode a JWT payload without signature verification.
+ * Safe here because downstream microservices still perform full JWT verification.
+ * If the JWT is invalid, downstream will reject the request and the enriched
+ * header becomes irrelevant.
+ */
+function decodeJwtPayload(token: string): Record<string, unknown> | null {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return null;
+    const payload = Buffer.from(parts[1], 'base64url').toString('utf8');
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Role enrichment middleware.
+ *
+ * For authenticated (Bearer) requests:
+ *   1. Decodes the JWT to extract `sub` (Cognito subject)
+ *   2. Looks up the user in the DB by `cognitoSub`
+ *   3. If found, sets `x-lb-enriched-role` header with the DB-backed role
+ *
+ * Skipped for dev-bypass requests (role comes from dev headers).
+ * On any failure (decode error, DB unavailable), the request proceeds
+ * without enrichment — downstream uses the JWT-derived role (graceful degradation).
+ */
+async function enrichRole(req: import('express').Request, _res: import('express').Response, next: import('express').NextFunction): Promise<void> {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return next();
+    }
+
+    // Skip enrichment for dev-bypass requests (role already set via headers)
+    if (process.env.DEV_AUTH_BYPASS === 'true' && req.headers['x-dev-user-email']) {
+      return next();
+    }
+
+    const token = authHeader.slice(7);
+    const payload = decodeJwtPayload(token);
+    if (!payload || !payload.sub) {
+      return next();
+    }
+
+    const user = await queryOne<{ role: string }>(
+      'SELECT "role" FROM "User" WHERE "cognitoSub" = $1',
+      [payload.sub],
+    );
+
+    if (user) {
+      req.headers[ENRICHED_ROLE_HEADER] = user.role;
+      logger.debug({ sub: payload.sub, enrichedRole: user.role }, 'Role enriched from DB');
+    } else {
+      logger.debug({ sub: payload.sub }, 'No DB user found for cognitoSub — skipping role enrichment');
+    }
+  } catch (err) {
+    // Enrichment is best-effort; downstream auth still works without it.
+    logger.warn({ err }, 'Role enrichment failed — proceeding without enrichment');
+  }
+  next();
+}
+
+// Strip enriched role header from ALL incoming requests (security: prevent external injection)
+app.use((req, _res, next) => {
+  delete req.headers[ENRICHED_ROLE_HEADER];
+  next();
+});
+
 // Strip dev bypass headers in production/non-dev environments
 if (IS_PRODUCTION) {
   app.use((req, _res, next) => {
@@ -27,6 +103,9 @@ if (IS_PRODUCTION) {
     next();
   });
 }
+
+// Enrich authenticated requests with DB-backed role
+app.use(enrichRole);
 
 // Internal ALB URL — in ECS, services communicate via the ALB.
 // For local dev, each service runs on a different port.
@@ -81,6 +160,11 @@ function createProxy(service: string, pathPrefix: string, targetPathPrefix: stri
             const val = req.headers[h];
             if (val) proxyReq.setHeader(h, val as string);
           }
+        }
+        // Forward BFF-enriched role header (set by enrichRole middleware)
+        const enrichedRole = req.headers[ENRICHED_ROLE_HEADER];
+        if (enrichedRole) {
+          proxyReq.setHeader(ENRICHED_ROLE_HEADER, enrichedRole as string);
         }
         // Re-stream the body that express.json() already consumed.
         // MUST be called after all setHeader() calls, since it writes
