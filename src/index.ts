@@ -4,22 +4,17 @@ import { createProxyMiddleware, fixRequestBody, type Options } from 'http-proxy-
 const app = createApp();
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const DEV_BYPASS_ENABLED = process.env.DEV_AUTH_BYPASS === 'true';
 
-// Fail fast: DEV_AUTH_BYPASS must never be enabled in production
-if (IS_PRODUCTION && process.env.DEV_AUTH_BYPASS === 'true') {
-  logger.fatal('DEV_AUTH_BYPASS=true is not allowed when NODE_ENV=production — aborting');
-  process.exit(1);
-}
-
-if (!IS_PRODUCTION && process.env.DEV_AUTH_BYPASS === 'true') {
+if (DEV_BYPASS_ENABLED) {
   logger.warn('⚠ DEV_AUTH_BYPASS is enabled — auth bypass headers will be forwarded. Do NOT use in production.');
 }
 
 // Dev bypass header names
 const DEV_BYPASS_HEADERS = ['x-dev-user-email', 'x-dev-user-role', 'x-dev-org-id'];
 
-// Strip dev bypass headers in production/non-dev environments
-if (IS_PRODUCTION) {
+// Strip dev bypass headers when bypass is not explicitly enabled
+if (!DEV_BYPASS_ENABLED) {
   app.use((req, _res, next) => {
     for (const h of DEV_BYPASS_HEADERS) {
       delete req.headers[h];
@@ -75,8 +70,8 @@ function createProxy(service: string, pathPrefix: string, targetPathPrefix: stri
         if (auth) {
           proxyReq.setHeader('Authorization', auth);
         }
-        // Forward dev bypass headers (only in non-production; stripped by middleware otherwise)
-        if (!IS_PRODUCTION) {
+        // Forward dev bypass headers when DEV_AUTH_BYPASS is enabled
+        if (DEV_BYPASS_ENABLED) {
           for (const h of DEV_BYPASS_HEADERS) {
             const val = req.headers[h];
             if (val) proxyReq.setHeader(h, val as string);
