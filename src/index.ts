@@ -122,13 +122,14 @@ const webhookProxy = createProxyMiddleware({
       // The raw body is already available because express.json() stored it
       // and we need to re-stream it from req (the original readable stream
       // is consumed by express.json). We write the raw buffer directly.
-      if (req.body && Buffer.isBuffer(req.body)) {
-        proxyReq.setHeader('Content-Length', req.body.length.toString());
-        proxyReq.write(req.body);
+      const body = (req as any).body;
+      if (body && Buffer.isBuffer(body)) {
+        proxyReq.setHeader('Content-Length', body.length.toString());
+        proxyReq.write(body);
         proxyReq.end();
-      } else if (req.body) {
+      } else if (body) {
         // Fallback: re-serialize (may break signature, but prevents hang)
-        const bodyStr = JSON.stringify(req.body);
+        const bodyStr = JSON.stringify(body);
         proxyReq.setHeader('Content-Length', Buffer.byteLength(bodyStr).toString());
         proxyReq.write(bodyStr);
         proxyReq.end();
