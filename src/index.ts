@@ -3,6 +3,31 @@ import { createProxyMiddleware, fixRequestBody, type Options } from 'http-proxy-
 
 const app = createApp();
 
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// Fail fast: DEV_AUTH_BYPASS must never be enabled in production
+if (IS_PRODUCTION && process.env.DEV_AUTH_BYPASS === 'true') {
+  logger.fatal('DEV_AUTH_BYPASS=true is not allowed when NODE_ENV=production — aborting');
+  process.exit(1);
+}
+
+if (!IS_PRODUCTION && process.env.DEV_AUTH_BYPASS === 'true') {
+  logger.warn('⚠ DEV_AUTH_BYPASS is enabled — auth bypass headers will be forwarded. Do NOT use in production.');
+}
+
+// Dev bypass header names
+const DEV_BYPASS_HEADERS = ['x-dev-user-email', 'x-dev-user-role', 'x-dev-org-id'];
+
+// Strip dev bypass headers in production/non-dev environments
+if (IS_PRODUCTION) {
+  app.use((req, _res, next) => {
+    for (const h of DEV_BYPASS_HEADERS) {
+      delete req.headers[h];
+    }
+    next();
+  });
+}
+
 // Internal ALB URL — in ECS, services communicate via the ALB.
 // For local dev, each service runs on a different port.
 const ALB_URL = process.env.INTERNAL_ALB_URL || 'http://localhost';
@@ -50,10 +75,12 @@ function createProxy(service: string, pathPrefix: string, targetPathPrefix: stri
         if (auth) {
           proxyReq.setHeader('Authorization', auth);
         }
-        // Forward dev bypass headers
-        for (const h of ['x-dev-user-email', 'x-dev-user-role', 'x-dev-org-id']) {
-          const val = req.headers[h];
-          if (val) proxyReq.setHeader(h, val as string);
+        // Forward dev bypass headers (only in non-production; stripped by middleware otherwise)
+        if (!IS_PRODUCTION) {
+          for (const h of DEV_BYPASS_HEADERS) {
+            const val = req.headers[h];
+            if (val) proxyReq.setHeader(h, val as string);
+          }
         }
         // Re-stream the body that express.json() already consumed.
         // MUST be called after all setHeader() calls, since it writes
@@ -125,6 +152,7 @@ logger.info('Webhook proxy route registered: /api/payments/webhooks → payments
 
 // Register proxy routes (order matters — more specific first)
 createProxy('auth', '/api/auth', '/internal/auth');
+createProxy('properties', '/api/pm', '/internal/pm');
 createProxy('properties', '/api/properties', '/internal/properties');
 createProxy('leases', '/api/leases', '/internal/leases');
 createProxy('tenants', '/api/tenants', '/internal/tenants');
