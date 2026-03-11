@@ -4,7 +4,7 @@ WORKDIR /app
 # Install from local service-common tarball (dev build)
 COPY package.json ./
 COPY leasebase-service-common-*.tgz ./
-RUN sed -i 's|"@leasebase/service-common": "[^"]*"|"@leasebase/service-common": "file:./leasebase-service-common-1.1.0.tgz"|' package.json && \
+RUN sed -i 's|"@leasebase/service-common": "[^"]*"|"@leasebase/service-common": "file:./leasebase-service-common-1.2.0.tgz"|' package.json && \
     npm install --ignore-scripts
 
 COPY tsconfig.json ./
