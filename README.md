@@ -1,10 +1,10 @@
 # LeaseBase bff-gateway
 
-API composition layer and auth middleware (BFF pattern). Routes external requests to internal microservices.
+API gateway / reverse proxy (BFF pattern). Routes external requests to internal microservices. **Does not perform authentication or role resolution** — auth is handled by each downstream service via `@leasebase/service-common` `requireAuth` middleware.
 
 ## Stack
 
-- **Runtime**: Node.js / NestJS (planned)
+- **Runtime**: Node.js / Express + http-proxy-middleware
 - **Container**: Docker -> ECS Fargate
 - **Registry**: ECR `leasebase-{env}-v2-bff-gateway`
 - **Port**: 3000
