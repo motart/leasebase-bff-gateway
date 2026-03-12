@@ -55,6 +55,96 @@ function getTarget(service: string): string {
   return `http://localhost:${port}`;
 }
 
+// ── Role enrichment ──────────────────────────────────────────────────────────
+// Downstream data-plane services cannot query the User table (different DB
+// credentials). The BFF resolves the user's role by calling auth-service and
+// forwards it via the trusted `x-lb-enriched-role` header so that the
+// requireAuth middleware in each service picks it up at priority 1.
+
+interface RoleCacheEntry {
+  role: string;
+  expiresAt: number;
+}
+
+const roleCache = new Map<string, RoleCacheEntry>();
+const ROLE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// Periodic cleanup of expired entries (every 60s)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of roleCache) {
+    if (entry.expiresAt <= now) roleCache.delete(key);
+  }
+}, 60_000).unref();
+
+/**
+ * Middleware: resolve user role via auth-service and attach to request.
+ * Runs before proxy routes for non-auth paths.
+ * On failure, silently continues — downstream services fall back to their
+ * own role resolution (DB lookup or TENANT default).
+ */
+app.use(async (req, _res, next) => {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return next();
+
+  // Skip for auth routes — auth-service resolves its own roles
+  if (req.path.startsWith('/api/auth')) return next();
+
+  try {
+    // Decode JWT payload (no verification — downstream services verify)
+    const token = auth.slice(7);
+    const parts = token.split('.');
+    if (parts.length !== 3) return next();
+
+    const payload = JSON.parse(
+      Buffer.from(parts[1], 'base64url').toString(),
+    );
+    const sub = payload.sub as string | undefined;
+    if (!sub) return next();
+
+    // Check cache
+    const cached = roleCache.get(sub);
+    if (cached && cached.expiresAt > Date.now()) {
+      (req as any)._enrichedRole = cached.role;
+      return next();
+    }
+
+    // Call auth-service to resolve the role
+    const authTarget = getTarget('auth');
+    const meUrl = `${authTarget}/internal/auth/me`;
+    const resp = await fetch(meUrl, {
+      headers: { Authorization: auth },
+      signal: AbortSignal.timeout(3000), // 3s timeout
+    });
+
+    if (resp.ok) {
+      const data = (await resp.json()) as { role?: string };
+      if (data.role) {
+        roleCache.set(sub, {
+          role: data.role,
+          expiresAt: Date.now() + ROLE_CACHE_TTL_MS,
+        });
+        (req as any)._enrichedRole = data.role;
+        logger.debug(
+          { sub, role: data.role },
+          'BFF role enrichment: resolved via auth-service',
+        );
+      }
+    } else {
+      logger.warn(
+        { sub, status: resp.status },
+        'BFF role enrichment: auth-service returned non-OK',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'BFF role enrichment failed — downstream will resolve role');
+  }
+
+  next();
+});
+
+// ── Proxy helpers ────────────────────────────────────────────────────────────
+
 function createProxy(service: string, pathPrefix: string, targetPathPrefix: string): void {
   const proxyOptions: Options = {
     target: getTarget(service),
@@ -74,6 +164,11 @@ function createProxy(service: string, pathPrefix: string, targetPathPrefix: stri
         const auth = req.headers.authorization;
         if (auth) {
           proxyReq.setHeader('Authorization', auth);
+        }
+        // Forward enriched role (set by role-enrichment middleware above)
+        const enrichedRole = (req as any)._enrichedRole as string | undefined;
+        if (enrichedRole) {
+          proxyReq.setHeader('x-lb-enriched-role', enrichedRole);
         }
         // Forward dev bypass headers (only in non-production; stripped by middleware otherwise)
         if (!IS_PRODUCTION) {
@@ -119,8 +214,8 @@ const webhookProxy = createProxyMiddleware({
       const sig = req.headers['stripe-signature'];
       if (sig) proxyReq.setHeader('stripe-signature', sig as string);
       // Do NOT call fixRequestBody — let the raw body stream through.
-      // The raw body is already available because express.json() stored it
-      // and we need to re-stream it from req (the original readable stream
+      // The raw body is already available because express.json() already consumed
+      // it and we need to re-stream it from req (the original readable stream
       // is consumed by express.json). We write the raw buffer directly.
       const body = (req as any).body;
       if (body && Buffer.isBuffer(body)) {
